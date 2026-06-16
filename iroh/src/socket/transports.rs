@@ -309,7 +309,7 @@ impl Transports {
                         // where `poll_recv` would be called right away again and again even if
                         // the non-failing transports are all pending.
                         total_errors += 1;
-                        warn!(transport = $debug_label, "recv error: {err:#}");
+                        warn!(transport = %$debug_label, "recv error: {err:#}");
                     }
                 }
             };
@@ -344,7 +344,12 @@ impl Transports {
         if total_polled == total_errors {
             // All transports errored.
             self.consecutive_total_recv_failures += 1;
+            warn!(
+                "All transports failed to receive ({} remaining)",
+                MAX_CONSECUTIVE_RECV_ERRORS.wrapping_sub(self.consecutive_total_recv_failures)
+            );
             if self.consecutive_total_recv_failures >= MAX_CONSECUTIVE_RECV_ERRORS {
+                warn!("All transports failed to receive. QUIC endpoint will be shutdown.");
                 Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::NetworkDown,
                     "All transports failed to receive",

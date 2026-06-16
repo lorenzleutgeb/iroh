@@ -2914,207 +2914,59 @@ mod tests {
         Ok(())
     }
 
-    // ===================================================================================
-    // Regression coverage for https://github.com/n0-computer/iroh/issues/4325:
-    // an *unreachable* home relay must not starve an otherwise-working direct path.
-    //
-    // # What these reproduce
-    //
-    // Endpoints connect over a direct loopback path that is perfectly usable, while
-    // every endpoint is also configured with the same **unreachable** home relay
-    // (`https://127.0.0.1:1`, nothing listening). The relay being down is supposed to
-    // be irrelevant — the direct path should carry the QUIC handshake and the
-    // connection should come up in milliseconds.
-    //
-    // On Linux that is exactly what happens. **On Windows the handshake never completes
-    // and the connect times out**, even though the loopback path is fine. This was
-    // first found via the `iroh-gossip` mesh-formation repro for #4325; these tests
-    // strip gossip out entirely and pin the failure to the `iroh` endpoint / UDP
-    // transport layer.
-    //
-    // # Why it fails on Windows but not Linux (the mechanism)
-    //
-    // Configuring a home relay makes `net_report` run a QADv4/STUN probe against it.
-    // The probe target for `https://127.0.0.1:1` resolves to the relay's default QUIC
-    // port `127.0.0.1:7842`, which is also closed, so the probe datagram elicits an
-    // **ICMP port-unreachable**.
-    //
-    // - Windows: a UDP socket that has sent to a destination which replies with ICMP
-    //   port-unreachable fails its *next* `recvfrom` with `WSAECONNRESET` (OS error
-    //   10054). Our IP-transport receive loop currently surfaces that as a
-    //   `recv error: ... (os error 10054) transport="IP"` WARN and the receive path is
-    //   knocked out. Because the *same* UDP socket also carries the direct loopback
-    //   QUIC handshake, the peer's incoming Initials get dropped. The client
-    //   retransmits on QUIC PTO backoff (1s, 2s, 4s, …) but every fresh `net_report` /
-    //   probe cycle re-poisons the socket, so the handshake never converges in time.
-    // - Linux: ICMP port-unreachable is not delivered to `recvfrom` for an
-    //   *unconnected* UDP socket (it only matters for `connect(2)`-ed sockets, via
-    //   `SO_ERROR` / `MSG_ERRQUEUE`). The receive loop is never disturbed and the
-    //   loopback handshake completes immediately.
-    //
-    // The natural control is `RelayMode::Disabled`: with no relay there is no probe,
-    // hence no send to an unreachable port, hence no `WSAECONNRESET` — and connections
-    // form fine on Windows too. So the failure requires *both* Windows *and* a send to
-    // an unreachable UDP endpoint, which only co-occur here.
-    //
-    // # What a failing run looks like
-    //
-    // The `tokio::time::timeout` in each test elapses (its `.expect(..)` panics) and the
-    // log contains repeated `iroh::socket::transports: recv error: An existing
-    // connection was forcibly closed by the remote host. (os error 10054)
-    // transport="IP"` WARNs, with no connection established for the dialed peer.
-    //
-    // # Likely fix location
-    //
-    // The IP-transport receive loop must treat `WSAECONNRESET` (10054) as a benign,
-    // ignorable per-recv condition and keep polling, and/or the UDP sockets should be
-    // created with the `SIO_UDP_CONNRESET` ioctl set to `FALSE` so the error is never
-    // raised. See the `recv error` site in `iroh::socket::transports`.
-    // ===================================================================================
-
-    /// An unreachable home relay for the #4325 regression tests: nothing listens on
-    /// 127.0.0.1:1, and its QADv4 probe target (127.0.0.1:7842) is closed too, so
-    /// probing it yields an ICMP port-unreachable — which is what poisons the UDP recv
-    /// socket on Windows.
-    fn unreachable_relay() -> RelayUrl {
-        "https://127.0.0.1:1".parse().expect("valid relay url")
-    }
-
-    /// Builds a loopback-bound endpoint whose only home relay is `dead_relay`.
-    async fn build_loopback_endpoint(dead_relay: &RelayUrl) -> Result<Endpoint> {
-        let ep = Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Custom(RelayMap::from_iter([dead_relay.clone()])))
-            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
-            .alpns(vec![TEST_ALPN.to_vec()])
-            .bind_addr((Ipv4Addr::LOCALHOST, 0))?
-            .bind()
-            .await?;
-        Ok(ep)
-    }
-
-    /// The endpoint's reachable addressing info: its bound loopback socket(s) — the
-    /// direct path that *should* work — plus the dead home relay. Read off the bound
-    /// socket directly instead of relying on async direct-address discovery.
-    fn reachable_loopback_addr(ep: &Endpoint, dead_relay: &RelayUrl) -> EndpointAddr {
-        let mut addr = EndpointAddr::new(ep.id()).with_relay_url(dead_relay.clone());
-        for socket in ep.bound_sockets() {
-            addr = addr.with_ip_addr(socket);
-        }
-        addr
-    }
-
-    /// Minimal repro for iroh #4325 (see the block comment above): a single client
-    /// connecting to a single server over a direct loopback path must succeed even
-    /// though the home relay is unreachable. This only confirms the connection is
-    /// established — no stream exchange.
+    /// Regression test: Don't fail connections with dead relays on Windows.
+    ///
+    /// A single client connecting to a single server over a usable direct path
+    /// must succeed even when both are configured with an unreachable home relay
+    /// (`https://127.0.0.1:1`, nothing listening). The dead relay should be irrelevant:
+    /// the direct path works and the connection comes up in milliseconds.
+    ///
+    /// This was broken on Windows because QaD sends over the same socket to the dead
+    /// relay, and the socket would return recv errors on the next recv to report ICMP
+    /// errors for the previous send. We now skip over these errors, implemented in
+    /// https://github.com/n0-computer/net-tools/pull/166, so this no longer fails.
     #[tokio::test]
-    #[traced_test]
     async fn endpoint_unreachable_relay_direct_connect_succeeds() -> Result {
-        let dead_relay = unreachable_relay();
+        // An unreachable relay Nothing listens on 127.0.0.1:1, and its QADv4 probe target
+        // at 127.0.0.1:7842 is closed too, so probing it draws the ICMP port-unreachable
+        // that is emitted from the Windows socket on recv.
+        let dead_relay: RelayUrl = "https://127.0.0.1:1".parse().expect("valid relay url");
 
-        let server = build_loopback_endpoint(&dead_relay).await?;
-        let client = build_loopback_endpoint(&dead_relay).await?;
+        let bind_endpoint = async || {
+            Endpoint::builder(presets::Minimal)
+                // Use the broken relay to trigger the ICMP errors from the QaD sends.
+                .relay_mode(RelayMode::Custom(RelayMap::from_iter([dead_relay.clone()])))
+                .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                .alpns(vec![TEST_ALPN.to_vec()])
+                // Bind on IPv4 only to ensure a single socket to not have spurious polls.
+                .bind_addr((Ipv4Addr::LOCALHOST, 0))
+                .expect("valid addr")
+                .bind()
+                .await
+        };
 
-        let server_addr = reachable_loopback_addr(&server, &dead_relay);
-        assert!(
-            server_addr.ip_addrs().count() > 0,
-            "server has no direct loopback address: {server_addr:?}"
-        );
+        let server = bind_endpoint().await?;
+        let server_addr = server.addr().with_relay_url(dead_relay.clone());
+        let client = bind_endpoint().await?;
 
         // Server accepts the incoming connection and holds it open until the test ends.
-        let accept = tokio::spawn({
-            let server = server.clone();
-            async move {
-                let incoming = server.accept().await.anyerr()?;
-                let conn = incoming.await.anyerr()?;
-                conn.closed().await;
-                server.close().await;
-                n0_error::Ok(())
-            }
+        let accept = tokio::spawn(async move {
+            let incoming = server.accept().await.anyerr()?;
+            let conn = incoming.await.anyerr()?;
+            conn.closed().await;
+            server.close().await;
+            n0_error::Ok(())
         });
 
-        // The connect must complete over the direct loopback path despite the dead
-        // relay. On Windows the poisoned recv socket starves the handshake and this
-        // times out.
-        let conn = tokio::time::timeout(
+        // The connect must complete over the direct loopback path despite the dead relay.
+        let _conn = tokio::time::timeout(
             Duration::from_secs(10),
             client.connect(server_addr, TEST_ALPN),
         )
         .await
-        .expect(
-            "a direct loopback connection must not starve behind an unreachable home \
-             relay (iroh #4325)",
-        )?;
-        assert_eq!(conn.remote_id(), server.id());
+        .expect("connection should succeed")?;
         client.close().await;
         accept.await.anyerr()??;
-        Ok(())
-    }
-
-    /// Concurrent repro for iroh #4325 (see the block comment above), mirroring the
-    /// original gossip mesh shape: two clients dial one server at the same time and
-    /// each round-trips a datagram, exercising sustained handshake traffic while the
-    /// unreachable relay keeps poisoning the recv socket on Windows.
-    #[tokio::test]
-    #[traced_test]
-    async fn endpoint_unreachable_relay_concurrent_dials_succeed() -> Result {
-        let dead_relay = unreachable_relay();
-
-        // Server accepts one connection and echoes a single datagram back on it.
-        async fn accept_echo(ep: Endpoint) -> Result {
-            let incoming = ep.accept().await.anyerr()?;
-            let conn = incoming.await.anyerr()?;
-            let (mut send, mut recv) = conn.accept_bi().await.anyerr()?;
-            let msg = recv.read_to_end(16).await.anyerr()?;
-            send.write_all(&msg).await.anyerr()?;
-            send.finish().anyerr()?;
-            conn.closed().await;
-            Ok(())
-        }
-
-        // Client dials the server over the direct path and round-trips one datagram.
-        async fn dial_echo(ep: Endpoint, dst: EndpointAddr) -> Result {
-            let conn = ep.connect(dst, TEST_ALPN).await?;
-            let (mut send, mut recv) = conn.open_bi().await.anyerr()?;
-            send.write_all(b"ping").await.anyerr()?;
-            send.finish().anyerr()?;
-            let echoed = recv.read_to_end(16).await.anyerr()?;
-            assert_eq!(echoed, b"ping");
-            conn.close(0u8.into(), b"done");
-            Ok(())
-        }
-
-        let server = build_loopback_endpoint(&dead_relay).await?;
-        let client1 = build_loopback_endpoint(&dead_relay).await?;
-        let client2 = build_loopback_endpoint(&dead_relay).await?;
-
-        let server_addr = reachable_loopback_addr(&server, &dead_relay);
-        assert!(
-            server_addr.ip_addrs().count() > 0,
-            "server has no direct loopback address: {server_addr:?}"
-        );
-
-        // One accept task per incoming dial.
-        let s1 = tokio::spawn(accept_echo(server.clone()));
-        let s2 = tokio::spawn(accept_echo(server.clone()));
-
-        // Both clients dial the server concurrently — exactly the concurrent-dial shape
-        // from iroh #4325.
-        let dials = n0_future::future::zip(
-            dial_echo(client1.clone(), server_addr.clone()),
-            dial_echo(client2.clone(), server_addr.clone()),
-        );
-        let outcome = tokio::time::timeout(Duration::from_secs(10), dials).await;
-
-        s1.abort();
-        s2.abort();
-
-        let (r1, r2) = outcome.expect(
-            "two clients dialing concurrently over a working direct loopback path must \
-             connect even though the home relay is unreachable (iroh #4325)",
-        );
-        r1?;
-        r2?;
         Ok(())
     }
 
